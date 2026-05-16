@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Bird Sound Analyzer</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #050914;
+      color: white;
+      font-family: Arial, Helvetica, sans-serif;
+      touch-action: none;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #startScreen {
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      background: radial-gradient(circle at center, #12324f 0%, #050914 72%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      text-align: center;
+    }
+
+    #startBox {
+      max-width: 620px;
+      width: 100%;
+      border: 1px solid rgba(0, 255, 210, 0.45);
+      background: rgba(0, 0, 0, 0.5);
+      border-radius: 22px;
+      padding: 28px;
+      box-shadow: 0 0 40px rgba(0,255,220,0.18);
+    }
+
+    h1 {
+      margin: 0 0 12px 0;
+      font-size: clamp(28px, 8vw, 54px);
+      color: #7dffe7;
+      text-shadow: 0 0 20px rgba(0,255,220,0.65);
+    }
+
+    p {
+      color: #d8f7ff;
+      line-height: 1.45;
+      font-size: 16px;
+    }
+
+    button {
+      border: 1px solid rgba(0,255,210,0.75);
+      background: rgba(0,255,210,0.16);
+      color: white;
+      padding: 14px 20px;
+      border-radius: 16px;
+      font-size: 17px;
+      font-weight: 700;
+      margin: 7px;
+      cursor: pointer;
+    }
+
+    button:active {
+      transform: scale(0.96);
+      background: rgba(0,255,210,0.32);
+    }
+
+    #controls {
+      position: fixed;
+      left: 10px;
+      right: 10px;
+      bottom: 10px;
+      z-index: 10;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 6px;
+      pointer-events: auto;
+    }
+
+    .smallBtn {
+      padding: 9px 11px;
+      font-size: 13px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.55);
+      backdrop-filter: blur(8px);
+    }
+
+    #msg {
+      position: fixed;
+      top: 10px;
+      left: 10px;
+      right: 10px;
+      z-index: 12;
+      text-align: center;
+      color: #fff0a0;
+      font-size: 13px;
+      pointer-events: none;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="startScreen">
+    <div id="startBox">
+      <h1>Bird Sound Analyzer</h1>
+      <p>
+        Webowa wersja analizatora ptasiego śpiewu. Działa w Safari na iPhonie,
+        ale mikrofon wymaga zgody i zwykle strony HTTPS.
+      </p>
+      <p>
+        Kliknij start, pozwól na mikrofon, a potem zapisuj wzorce ptaków 1–5
+        i porównuj aktualny dźwięk.
+      </p>
+      <button onclick="startApp()">START MICROPHONE</button>
+      <p style="font-size:13px; opacity:0.8;">
+        Uwaga: to nie jest prawdziwy BirdNET. To edukacyjna analiza częstotliwości i podobieństwa wzorców.
+      </p>
+    </div>
+  </div>
+
+  <div id="msg"></div>
+
+  <div id="controls" style="display:none;">
+    <button class="smallBtn" onclick="saveTemplate(0)">Save 1</button>
+    <button class="smallBtn" onclick="saveTemplate(1)">Save 2</button>
+    <button class="smallBtn" onclick="saveTemplate(2)">Save 3</button>
+    <button class="smallBtn" onclick="saveTemplate(3)">Save 4</button>
+    <button class="smallBtn" onclick="saveTemplate(4)">Save 5</button>
+    <button class="smallBtn" onclick="classifyCurrent()">Compare</button>
+    <button class="smallBtn" onclick="clearTemplates()">Clear</button>
+  </div>
+
+  <script>
+    let audioCtx;
+    let analyser;
+    let micStream;
+    let source;
+
+    let fftSize = 4096;
+    let freqData;
+    let timeData;
+
+    let started = false;
+
+    let canvas;
+    let ctx;
+    let W = 0;
+    let H = 0;
+
+    let bands = 256;
+    let spectrum = new Array(bands).fill(0);
+    let smoothSpectrum = new Array(bands).fill(0);
+
+    let spectrogram;
+    let spectroCtx;
+    let spectroH = 230;
+
+    let micLevel = 0;
+    let micPeak = 0;
+
+    let currentFeature = makeFeature();
+    let templates = [null, null, null, null, null];
+
+    let resultText = "Brak klasyfikacji";
+    let hintText = "Czekam na dźwięk ptaka...";
+    let birdLikeSound = false;
+
+    let sampleRate = 44100;
+
+    function makeFeature() {
+      return {
+        peakFreq: 0,
+        centroidFreq: 0,
+        bandwidth: 0,
+        highRatio: 0,
+        energy: 0
+      };
+    }
+
+    function copyFeature(f) {
+      return {
+        peakFreq: f.peakFreq,
+        centroidFreq: f.centroidFreq,
+        bandwidth: f.bandwidth,
+        highRatio: f.highRatio,
+        energy: f.energy
+      };
+    }
+
+    async function startApp() {
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        await audioCtx.resume();
+
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false
+          },
+          video: false
+        });
+
+        source = audioCtx.createMediaStreamSource(micStream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = fftSize;
+        analyser.smoothingTimeConstant = 0.1;
+
+        source.connect(analyser);
+
+        sampleRate = audioCtx.sampleRate;
+
+        freqData = new Uint8Array(analyser.frequencyBinCount);
+        timeData = new Uint8Array(analyser.fftSize);
+
+        document.getElementById("startScreen").style.display = "none";
+        document.getElementById("controls").style.display = "flex";
+
+        started = true;
+        showMessage("Mikrofon działa. Mów, gwizdnij albo puść cicho nagranie ptaka.");
+        resize();
+        loop();
+      } catch (err) {
+        console.error(err);
+        alert("Nie udało się uruchomić mikrofonu. Sprawdź zgodę na mikrofon i uruchom stronę przez HTTPS.");
+      }
+    }
+
+    function showMessage(t) {
+      const el = document.getElementById("msg");
+      el.textContent = t;
+      clearTimeout(showMessage.timer);
+      showMessage.timer = setTimeout(() => {
+        el.textContent = "";
+      }, 2500);
+    }
+
+    function setupCanvas() {
+      canvas = document.createElement("canvas");
+      document.body.appendChild(canvas);
+      ctx = canvas.getContext("2d");
+
+      spectrogram = document.createElement("canvas");
+      spectroCtx = spectrogram.getContext("2d");
+
+      resize();
+      window.addEventListener("resize", resize);
+      window.addEventListener("orientationchange", () => setTimeout(resize, 400));
+    }
+
+    function resize() {
+      W = window.innerWidth;
+      H = window.innerHeight;
+
+      canvas.width = W * devicePixelRatio;
+      canvas.height = H * devicePixelRatio;
+      canvas.style.width = W + "px";
+      canvas.style.height = H + "px";
+      ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+
+      spectroH = Math.min(250, Math.floor(H * 0.30));
+      spectrogram.width = W;
+      spectrogram.height = spectroH;
+      spectroCtx.fillStyle = "black";
+      spectroCtx.fillRect(0, 0, W, spectroH);
+    }
+
+    function loop() {
+      if (!started) return;
+
+      analyser.getByteFrequencyData(freqData);
+      analyser.getByteTimeDomainData(timeData);
+
+      analyseAudio();
+      updateSpectrogram();
+      draw();
+
+      requestAnimationFrame(loop);
+    }
+
+    function analyseAudio() {
+      micLevel = 0;
+      micPeak = 0;
+
+      for (let i = 0; i < timeData.length; i++) {
+        let v = (timeData[i] - 128) / 128;
+        micLevel += Math.abs(v);
+        micPeak = Math.max(micPeak, Math.abs(v));
+      }
+
+      micLevel /= timeData.length;
+
+      let energy = 0;
+      let birdEnergy = 0;
+
+      let weightedFreqSum = 0;
+      let magnitudeSum = 0;
+
+      let peakVal = 0;
+      let peakFreq = 0;
+
+      let lowBirdHz = 1000;
+      let highBirdHz = 10000;
+      let nyquist = sampleRate / 2;
+
+      for (let i = 0; i < bands; i++) {
+        let norm = i / (bands - 1);
+        let logNorm = Math.pow(norm, 2.0);
+
+        let bin = Math.floor(logNorm * (freqData.length - 1));
+        bin = clamp(bin, 1, freqData.length - 1);
+
+        let mag = freqData[bin] / 255;
+        let freq = bin * nyquist / freqData.length;
+
+        spectrum[i] = mag;
+        smoothSpectrum[i] = lerp(smoothSpectrum[i], mag, 0.22);
+
+        energy += mag;
+
+        if (freq >= lowBirdHz && freq <= highBirdHz) {
+          birdEnergy += mag;
+          weightedFreqSum += freq * mag;
+          magnitudeSum += mag;
+
+          if (mag > peakVal) {
+            peakVal = mag;
+            peakFreq = freq;
+          }
+        }
+      }
+
+      let centroidFreq = magnitudeSum > 0.0001 ? weightedFreqSum / magnitudeSum : 0;
+      let bandwidth = calculateBandwidth(centroidFreq);
+      let highRatio = calculateHighRatio();
+
+      birdLikeSound =
+        micLevel > 0.006 &&
+        birdEnergy > 5.0 &&
+        peakFreq > 1200 &&
+        peakFreq < 11000;
+
+      currentFeature.peakFreq = lerp(currentFeature.peakFreq, peakFreq, 0.15);
+      currentFeature.centroidFreq = lerp(currentFeature.centroidFreq, centroidFreq, 0.15);
+      currentFeature.bandwidth = lerp(currentFeature.bandwidth, bandwidth, 0.15);
+      currentFeature.highRatio = lerp(currentFeature.highRatio, highRatio, 0.15);
+      currentFeature.energy = lerp(currentFeature.energy, birdEnergy, 0.15);
+
+      hintText = birdLikeSound ? guessSimpleBirdType() : "Brak wyraźnego ptasiego śpiewu";
+    }
+
+    function calculateBandwidth(centroid) {
+      if (centroid <= 0) return 0;
+
+      let nyquist = sampleRate / 2;
+      let sum = 0;
+      let magSum = 0;
+
+      for (let i = 0; i < freqData.length; i++) {
+        let freq = i * nyquist / freqData.length;
+        if (freq >= 1000 && freq <= 10000) {
+          let mag = freqData[i] / 255;
+          sum += Math.abs(freq - centroid) * mag;
+          magSum += mag;
+        }
+      }
+
+      if (magSum <= 0.0001) return 0;
+      return sum / magSum;
+    }
+
+    function calculateHighRatio() {
+      let nyquist = sampleRate / 2;
+      let low = 0;
+      let high = 0;
+
+      for (let i = 0; i < freqData.length; i++) {
+        let freq = i * nyquist / freqData.length;
+        let mag = freqData[i] / 255;
+
+        if (freq >= 1000 && freq < 4000) low += mag;
+        if (freq >= 4000 && freq <= 10000) high += mag;
+      }
+
+      if (low + high <= 0.0001) return 0;
+      return high / (low + high);
+    }
+
+    function guessSimpleBirdType() {
+      const peakFreq = currentFeature.peakFreq;
+      const centroidFreq = currentFeature.centroidFreq;
+      const bandwidth = currentFeature.bandwidth;
+      const highRatio = currentFeature.highRatio;
+
+      if (peakFreq < 2500 && centroidFreq < 3500) {
+        return "Niski/melodyjny śpiew — możliwy kos/drozd/większy ptak";
+      }
+
+      if (peakFreq >= 2500 && peakFreq < 5000 && bandwidth > 1200) {
+        return "Średnie pasmo, szeroki śpiew — możliwy rudzik/kos/sikora";
+      }
+
+      if (peakFreq >= 5000 && highRatio > 0.55) {
+        return "Wysokie ćwierkanie — możliwa sikorka/wróbel/mały ptak";
+      }
+
+      if (peakFreq > 7000) {
+        return "Bardzo wysokie krótkie dźwięki — mały ptak albo owad/zakłócenie";
+      }
+
+      return "Ptasio-podobny dźwięk, ale niepewne";
+    }
+
+    function updateSpectrogram() {
+      const w = spectrogram.width;
+      const h = spectrogram.height;
+
+      const img = spectroCtx.getImageData(1, 0, w - 1, h);
+      spectroCtx.putImageData(img, 0, 0);
+
+      for (let y = 0; y < h; y++) {
+        let pos = map(h - 1 - y, 0, h - 1, 0, 1);
+        let logPos = Math.pow(pos, 2.0);
+
+        let idx = Math.floor(logPos * (bands - 1));
+        idx = clamp(idx, 0, smoothSpectrum.length - 1);
+
+        let level = clamp(smoothSpectrum[idx] * 255 * 2.2, 0, 255);
+
+        spectroCtx.fillStyle = spectralColor(level, y, h);
+        spectroCtx.fillRect(w - 1, y, 1, 1);
+      }
+    }
+
+    function spectralColor(level, y, h) {
+      let pos = 1.0 - y / h;
+      let hue = map(pos, 0, 1, 230, 20);
+      hue += level * 0.25;
+      hue = hue % 360;
+
+      let sat = clamp(50 + level * 0.25, 40, 100);
+      let bri = clamp(4 + level * 0.42, 4, 100);
+
+      return `hsl(${hue}, ${sat}%, ${bri}%)`;
+    }
+
+    function draw() {
+      ctx.fillStyle = "#050914";
+      ctx.fillRect(0, 0, W, H);
+
+      drawBackgroundGlow();
+      drawHeaderPanels();
+      drawSpectrum();
+      drawWaveform();
+      drawSpectrogram();
+      drawBottomHelp();
+    }
+
+    function drawBackgroundGlow() {
+      const g = ctx.createRadialGradient(W * 0.5, H * 0.42, 20, W * 0.5, H * 0.42, Math.max(W, H) * 0.75);
+      g.addColorStop(0, "rgba(0,255,210,0.13)");
+      g.addColorStop(0.45, "rgba(20,80,255,0.08)");
+      g.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, W, H);
+
+      ctx.strokeStyle = "rgba(255,255,255,0.045)";
+      ctx.lineWidth = 1;
+
+      for (let y = 0; y < H; y += 6) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(W, y);
+        ctx.stroke();
+      }
+    }
+
+    function panel(x, y, w, h) {
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      roundRect(x, y, w, h, 16, true, false);
+      ctx.strokeStyle = "rgba(0,255,210,0.35)";
+      ctx.lineWidth = 1;
+      roundRect(x, y, w, h, 16, false, true);
+    }
+
+    function drawHeaderPanels() {
+      const leftW = Math.min(480, W - 20);
+      panel(10, 10, leftW, 172);
+
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 22px Arial";
+      ctx.fillText("Bird Sound Analyzer", 28, 42);
+
+      ctx.font = "13px Arial";
+      ctx.fillStyle = "#d9f8ff";
+      ctx.fillText("Save 1–5 = zapisz wzorzec  |  Compare = porównaj", 28, 70);
+      ctx.fillText("To edukacyjna analiza pasma, nie pewne rozpoznanie gatunku.", 28, 92);
+
+      ctx.fillStyle = birdLikeSound ? "#61ff94" : "#ff9b74";
+      ctx.fillText("Bird-like sound: " + birdLikeSound, 28, 120);
+
+      ctx.fillStyle = "#fff3a5";
+      ctx.fillText(hintText, 28, 144);
+
+      if (W > 760) {
+        panel(W - 390, 10, 380, 172);
+
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "bold 19px Arial";
+        ctx.fillText("Current features", W - 370, 42);
+
+        ctx.font = "13px Arial";
+        ctx.fillStyle = "#d9f8ff";
+        ctx.fillText("Mic level: " + micLevel.toFixed(5) + "   Peak: " + micPeak.toFixed(2), W - 370, 70);
+        ctx.fillText("Peak frequency: " + Math.round(currentFeature.peakFreq) + " Hz", W - 370, 92);
+        ctx.fillText("Centroid: " + Math.round(currentFeature.centroidFreq) + " Hz", W - 370, 114);
+        ctx.fillText("Bandwidth: " + Math.round(currentFeature.bandwidth) + " Hz", W - 370, 136);
+        ctx.fillText("High ratio: " + currentFeature.highRatio.toFixed(2), W - 370, 158);
+      }
+
+      // templates panel small
+      const tw = Math.min(450, W - 20);
+      panel(10, 192, tw, 92);
+
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 15px Arial";
+      ctx.fillText("Templates", 28, 218);
+
+      ctx.font = "12px Arial";
+      for (let i = 0; i < 5; i++) {
+        ctx.fillStyle = templates[i] ? "#61ff94" : "#9aa7b0";
+        const text = templates[i]
+          ? `${i + 1}: saved ${Math.round(templates[i].peakFreq)} Hz`
+          : `${i + 1}: empty`;
+        ctx.fillText(text, 28 + i * 82, 246);
+      }
+
+      ctx.fillStyle = "#fff3a5";
+      ctx.fillText("Result: " + resultText, 28, 270);
+    }
+
+    function drawSpectrum() {
+      const x0 = 28;
+      const y0 = H * 0.36;
+      const w = W - 56;
+      const h = Math.min(220, H * 0.25);
+
+      if (y0 + h > H - spectroH - 110) return;
+
+      panel(x0 - 10, y0 - 32, w + 20, h + 50);
+
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "15px Arial";
+      ctx.fillText("Wideband FFT bird-song spectrum", x0, y0 - 12);
+
+      for (let i = 0; i < bands; i++) {
+        const x = map(i, 0, bands - 1, x0, x0 + w);
+        const barW = Math.max(1.5, w / bands);
+        const barH = clamp(smoothSpectrum[i] * h * 3.5, 1, h);
+
+        const hue = map(i, 0, bands - 1, 190, 20);
+        ctx.fillStyle = `hsla(${hue}, 90%, 55%, 0.82)`;
+        ctx.fillRect(x, y0 + h - barH, barW, barH);
+      }
+
+      // bird range approx
+      let xBird1 = frequencyToScreenX(1000, x0, w);
+      let xBird2 = frequencyToScreenX(10000, x0, w);
+
+      ctx.strokeStyle = "rgba(0,255,160,0.75)";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(xBird1, y0, xBird2 - xBird1, h);
+
+      ctx.fillStyle = "#00ffaa";
+      ctx.font = "12px Arial";
+      ctx.fillText("bird range approx. 1–10 kHz", xBird1 + 6, y0 + 18);
+
+      let peakX = frequencyToScreenX(currentFeature.peakFreq, x0, w);
+      ctx.strokeStyle = "rgba(255,255,255,0.85)";
+      ctx.beginPath();
+      ctx.moveTo(peakX, y0);
+      ctx.lineTo(peakX, y0 + h);
+      ctx.stroke();
+
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "12px Arial";
+      ctx.fillText(Math.round(currentFeature.peakFreq) + " Hz", peakX + 5, y0 - 6);
+    }
+
+    function frequencyToScreenX(freq, x0, w) {
+      const nyq = sampleRate / 2;
+      freq = clamp(freq, 0, nyq);
+      const norm = freq / nyq;
+      const displayNorm = Math.sqrt(norm);
+      return x0 + displayNorm * w;
+    }
+
+    function drawWaveform() {
+      const x0 = 28;
+      const y0 = H - spectroH - 105;
+      const w = W - 56;
+      const h = 70;
+
+      if (y0 < 300) return;
+
+      panel(x0 - 10, y0 - 26, w + 20, h + 42);
+
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "14px Arial";
+      ctx.fillText("Waveform", x0, y0 - 9);
+
+      ctx.strokeStyle = "rgba(120,255,220,0.9)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+
+      for (let i = 0; i < timeData.length; i += 4) {
+        let x = map(i, 0, timeData.length - 1, x0, x0 + w);
+        let v = (timeData[i] - 128) / 128;
+        let y = y0 + h / 2 + v * h * 0.75;
+
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+
+      ctx.stroke();
+
+      ctx.strokeStyle = "rgba(255,255,255,0.18)";
+      ctx.beginPath();
+      ctx.moveTo(x0, y0 + h / 2);
+      ctx.lineTo(x0 + w, y0 + h / 2);
+      ctx.stroke();
+    }
+
+    function drawSpectrogram() {
+      ctx.drawImage(spectrogram, 0, H - spectroH, W, spectroH);
+
+      ctx.strokeStyle = "rgba(255,255,255,0.2)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(0, H - spectroH, W, spectroH);
+
+      ctx.fillStyle = "rgba(0,0,0,0.45)";
+      ctx.fillRect(10, H - spectroH + 10, Math.min(430, W - 20), 28);
+
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "13px Arial";
+      ctx.fillText("Spectrogram: low frequencies bottom → high frequencies top", 22, H - spectroH + 29);
+    }
+
+    function drawBottomHelp() {
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(0, H - 52, W, 52);
+
+      ctx.fillStyle = "#d9f8ff";
+      ctx.font = "12px Arial";
+      ctx.textAlign = "center";
+      ctx.fillText("Na iPhone najlepiej otwórz przez HTTPS w Safari. Dodaj do ekranu: Share → Add to Home Screen.", W / 2, H - 18);
+      ctx.textAlign = "left";
+    }
+
+    function saveTemplate(i) {
+      templates[i] = copyFeature(currentFeature);
+      resultText = "Zapisano wzorzec " + (i + 1);
+      showMessage(resultText);
+    }
+
+    function clearTemplates() {
+      templates = [null, null, null, null, null];
+      resultText = "Wzorce wyczyszczone";
+      showMessage(resultText);
+    }
+
+    function classifyCurrent() {
+      let bestDistance = Infinity;
+      let bestIndex = -1;
+
+      for (let i = 0; i < templates.length; i++) {
+        if (templates[i]) {
+          const d = distanceTo(currentFeature, templates[i]);
+          if (d < bestDistance) {
+            bestDistance = d;
+            bestIndex = i;
+          }
+        }
+      }
+
+      if (bestIndex === -1) {
+        resultText = "Brak zapisanych wzorców";
+      } else {
+        resultText = "Najbliżej wzorca " + (bestIndex + 1) + " / distance " + bestDistance.toFixed(2);
+      }
+
+      showMessage(resultText);
+    }
+
+    function distanceTo(a, b) {
+      const dPeak = Math.abs(a.peakFreq - b.peakFreq) / 3000;
+      const dCentroid = Math.abs(a.centroidFreq - b.centroidFreq) / 3000;
+      const dBandwidth = Math.abs(a.bandwidth - b.bandwidth) / 3000;
+      const dHigh = Math.abs(a.highRatio - b.highRatio);
+      const dEnergy = Math.abs(a.energy - b.energy) / 8;
+
+      return dPeak * 2.0 +
+             dCentroid * 2.0 +
+             dBandwidth * 1.0 +
+             dHigh * 2.0 +
+             dEnergy * 0.5;
+    }
+
+    function map(v, a1, a2, b1, b2) {
+      return b1 + (v - a1) * (b2 - b1) / (a2 - a1);
+    }
+
+    function lerp(a, b, t) {
+      return a + (b - a) * t;
+    }
+
+    function clamp(v, lo, hi) {
+      return Math.max(lo, Math.min(hi, v));
+    }
+
+    function roundRect(x, y, w, h, r, fill, stroke) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+      if (fill) ctx.fill();
+      if (stroke) ctx.stroke();
+    }
+
+    setupCanvas();
+  </script>
+</body>
+</html>
